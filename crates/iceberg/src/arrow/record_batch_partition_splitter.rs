@@ -143,8 +143,18 @@ impl RecordBatchPartitionsplitter {
         let partition_columns = source_columns
             .into_iter()
             .zip_eq(self.transform_functions.iter())
-            .map(|(source_column, transform_function)| transform_function.transform(source_column))
+            //.map(|(source_column, transform_function)| transform_function.transform(source_column))
+            .zip_eq(self.projector.projected_schema_ref().fields())
+            .map(|((source_column, transform_function), partition_field)| {
+                transform_function
+                    .transform(source_column)
+                    .and_then(|transformed_column| {
+                        arrow_cast::cast(&transformed_column, partition_field.data_type())
+                            .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))
+                    })
+            })
             .collect::<Result<Vec<_>>>()?;
+        //assert!(false, "{:?}\n{:?}", self.projector.projected_schema_ref().fields(), partition_columns);
 
         self.split_by_partition(batch, &partition_columns)
     }
@@ -153,20 +163,34 @@ impl RecordBatchPartitionsplitter {
     pub fn convert_row(&self, rows: Vec<OwnedRow>) -> Result<Vec<Struct>> {
         let partition_type = self.partition_spec.partition_type(&self.schema)?;
         let partition_arrow_type = type_to_arrow_type(&Type::Struct(partition_type.clone()))?;
+        let partition_arrow_fields = {
+            let DataType::Struct(fields) = partition_arrow_type else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "The partition arrow type is not a struct type",
+                ));
+            };
+            fields
+        };
+
         let arrow_struct_array = {
             let partition_columns = self
                 .row_converter
                 .convert_rows(rows.iter().map(|row| row.row()))
                 .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("{e}")))?;
-            let partition_arrow_fields = {
-                let DataType::Struct(fields) = partition_arrow_type else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "The partition arrow type is not a struct type",
-                    ));
-                };
-                fields
-            };
+            let partition_columns = partition_columns
+                .iter()
+                .zip_eq(partition_arrow_fields.iter())
+                .map(|(column, field_type)| {
+                    arrow_cast::cast(column, field_type.data_type())
+                        .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // assert!(
+            //     false,
+            //     "{:?}\n{:?}\n{:?}",
+            //     partition_arrow_fields, partition_columns, rows
+            // );
             Arc::new(StructArray::try_new(
                 partition_arrow_fields,
                 partition_columns,
@@ -202,7 +226,7 @@ impl RecordBatchPartitionsplitter {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 
     use super::*;
     use crate::arrow::schema_to_arrow_schema;
@@ -417,6 +441,104 @@ mod tests {
             Struct::from_iter(vec![Some(Literal::int(1))]),
             Struct::from_iter(vec![Some(Literal::int(2))]),
             Struct::from_iter(vec![Some(Literal::int(3))]),
+        ]);
+    }
+
+    #[test]
+    fn test_record_batch_partition_split_by_date_partition() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        "time",
+                        Type::Primitive(crate::spec::PrimitiveType::Timestamp),
+                    )
+                    .into(),
+                    NestedField::required(
+                        2,
+                        "name",
+                        Type::Primitive(crate::spec::PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpecBuilder::new(schema.clone())
+                .with_spec_id(1)
+                .add_unbound_field(UnboundPartitionField {
+                    source_id: 1,
+                    field_id: None,
+                    name: "time_bucket".to_string(),
+                    transform: Transform::Day,
+                })
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let input_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let partition_splitter =
+            RecordBatchPartitionsplitter::new(input_schema.clone(), schema.clone(), partition_spec)
+                .expect("Failed to create splitter");
+
+        let time_array = TimestampMicrosecondArray::from(vec![
+            1744751608000000,
+            1744838008000000,
+            1744838009000000,
+            1744751609000000,
+        ]);
+        let data_array = StringArray::from(vec!["a", "b", "c", "d"]);
+        let batch = RecordBatch::try_new(input_schema.clone(), vec![
+            Arc::new(time_array),
+            Arc::new(data_array),
+        ])
+        .expect("Failed to create RecordBatch");
+
+        let mut partitioned_batches = partition_splitter
+            .split(&batch)
+            .expect("Failed to split RecordBatch");
+        assert_eq!(partitioned_batches.len(), 2);
+        partitioned_batches.sort_by_key(|(row, _)| row.clone());
+
+        {
+            // check the first partition
+            let expected_time_array =
+                TimestampMicrosecondArray::from(vec![1744751608000000, 1744751609000000]);
+            let expected_data_array = StringArray::from(vec!["a", "d"]);
+            let expected_batch = RecordBatch::try_new(input_schema.clone(), vec![
+                Arc::new(expected_time_array),
+                Arc::new(expected_data_array),
+            ])
+            .expect("Failed to create expected RecordBatch");
+            assert_eq!(partitioned_batches[0].1, expected_batch);
+        }
+        {
+            // check the second partition
+            let expected_time_array =
+                TimestampMicrosecondArray::from(vec![1744838008000000, 1744838009000000]);
+            let expected_data_array = StringArray::from(vec!["b", "c"]);
+            let expected_batch = RecordBatch::try_new(input_schema.clone(), vec![
+                Arc::new(expected_time_array),
+                Arc::new(expected_data_array),
+            ])
+            .expect("Failed to create expected RecordBatch");
+            assert_eq!(partitioned_batches[1].1, expected_batch);
+        }
+
+        let partition_values = partition_splitter
+            .convert_row(
+                partitioned_batches
+                    .iter()
+                    .map(|(row, _)| row.clone())
+                    .collect(),
+            )
+            .unwrap();
+        // check partition value is struct(1), struct(2)
+        assert_eq!(partition_values, vec![
+            Struct::from_iter(vec![Some(Literal::int(20193))]),
+            Struct::from_iter(vec![Some(Literal::int(20194))]),
         ]);
     }
 }
